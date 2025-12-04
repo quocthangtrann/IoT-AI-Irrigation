@@ -1,0 +1,494 @@
+import React, { useEffect, useState, useRef } from "react";
+import SensorPanel from "../components/SensorPanel.jsx";
+import LastWatered from "../components/LastWatered.jsx";
+import websocketService from "../services/websocketService";
+import apiService from "../services/apiService";
+import { useNavigate } from "react-router-dom"; 
+
+const LS_KEY = "smart-watering-lastWatered";
+const LS_HISTORY = "smart-watering-history";
+
+function formatMs(ms) {
+  if (!ms || ms <= 0) return "0s";
+  const s = Math.ceil(ms / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  const rem = s % 60;
+  return `${m}m ${rem}s`;
+}
+
+export default function SmartWateringDashboard() {
+  // State quản lý chế độ: "manual", "automatic", "ai"
+  const [mode, setMode] = useState("automatic");
+  const [pumpOn, setPumpOn] = useState(false);
+  const [lastWatered, setLastWatered] = useState(() => {
+    const v = localStorage.getItem(LS_KEY);
+    return v ? parseInt(v, 10) : null;
+  });
+
+  const [sensors, setSensors] = useState({
+    temp: 24,
+    hum: 66,
+    soil: 60,
+    level: 56,
+    flow: 0,
+  });
+
+  // Pump timing
+  const [remainingMs, setRemainingMs] = useState(0);
+  const remainingRef = useRef(0);
+  const pumpStartRef = useRef(null);
+  const pumpDurationRef = useRef(0);
+
+  // Manual duration
+  const [manualDurationSec, setManualDurationSec] = useState(10);
+  
+  // Connection status
+  const [isConnected, setIsConnected] = useState(false);
+  const [isLoading, setIsLoading] = useState(true);
+  const [stopConfirmData, setStopConfirmData] = useState(null);
+  const [isStopSubmitting, setIsStopSubmitting] = useState(false);
+
+  useEffect(() => {
+    // Connect to WebSocket
+    websocketService.connect();
+
+    // Handle sensor updates from WebSocket
+    const handleSensorUpdate = (data) => {
+      setSensors({
+        temp: data.temp || 0,
+        hum: data.hum || 0,
+        soil: data.soil || 0,
+        level: data.level || 0,
+        flow: data.flow || 0,
+      });
+    };
+
+    // Handle status updates from WebSocket
+    const handleStatusUpdate = (data) => {
+      setPumpOn(data.pumpOn || false);
+      // Cập nhật mode từ server gửi về (để đồng bộ)
+      if (data.mode) setMode(data.mode);
+      
+      setRemainingMs(data.remainingTime || 0);
+      
+      if (data.pumpStartTime) {
+        pumpStartRef.current = data.pumpStartTime;
+        pumpDurationRef.current = data.pumpDuration || 0;
+      } else {
+        pumpStartRef.current = null;
+        pumpDurationRef.current = 0;
+      }
+    };
+
+    // Handle mode updates
+    const handleModeUpdate = (data) => {
+      setMode(data.mode || "automatic");
+    };
+
+    // Handle connection status
+    const handleConnect = () => {
+      setIsConnected(true);
+      setIsLoading(false);
+      websocketService.requestSensors();
+      websocketService.requestStatus();
+    };
+
+    const handleDisconnect = () => {
+      setIsConnected(false);
+    };
+
+    // Register event listeners
+    websocketService.on('sensor_update', handleSensorUpdate);
+    websocketService.on('status_update', handleStatusUpdate);
+    websocketService.on('mode_update', handleModeUpdate);
+    websocketService.on('connect', handleConnect);
+    websocketService.on('disconnect', handleDisconnect);
+
+    if (websocketService.isConnected()) {
+      handleConnect();
+    }
+
+    // Initial data fetch via API
+    const fetchInitialData = async () => {
+      try {
+        const [sensorData, statusData] = await Promise.all([
+          apiService.getSensors(),
+          apiService.getStatus(),
+        ]);
+        
+        setSensors({
+          temp: sensorData.temp || 0,
+          hum: sensorData.hum || 0,
+          soil: sensorData.soil || 0,
+          level: sensorData.level || 0,
+          flow: sensorData.flow || 0,
+        });
+        
+        setPumpOn(statusData.pumpOn || false);
+        setMode(statusData.mode || "automatic");
+        setRemainingMs(statusData.remainingTime || 0);
+        
+        if (statusData.pumpStartTime) {
+          pumpStartRef.current = statusData.pumpStartTime;
+        }
+        
+        setIsLoading(false);
+      } catch (error) {
+        console.error('Failed to fetch initial data:', error);
+        setIsLoading(false);
+      }
+    };
+
+    fetchInitialData();
+
+    return () => {
+      websocketService.off('sensor_update', handleSensorUpdate);
+      websocketService.off('status_update', handleStatusUpdate);
+      websocketService.off('mode_update', handleModeUpdate);
+      websocketService.off('connect', handleConnect);
+      websocketService.off('disconnect', handleDisconnect);
+    };
+  }, []);
+
+  // Automatic rules (Client-side fallback, chủ yếu backend xử lý)
+  useEffect(() => {
+    if (mode !== "automatic") return;
+    if (sensors.soil < 40 && sensors.level > 20 && !pumpOn) {
+      handleAutoStart();
+    }
+  }, [mode, sensors.soil, sensors.level, pumpOn]);
+
+  // Keep ref in sync
+  useEffect(() => {
+    remainingRef.current = remainingMs;
+  }, [remainingMs]);
+
+  // Update remaining time logic
+  useEffect(() => {
+    if (pumpOn && remainingMs > 0) {
+      const interval = setInterval(() => {
+        if (pumpStartRef.current) {
+          const elapsed = Date.now() - pumpStartRef.current;
+          const remaining = Math.max(0, pumpDurationRef.current - elapsed);
+          setRemainingMs(remaining);
+        }
+      }, 250);
+      return () => clearInterval(interval);
+    }
+  }, [pumpOn, remainingMs]);
+
+  // History Implementation
+  function addHistoryEntry(entry) {
+    try {
+      const raw = localStorage.getItem(LS_HISTORY);
+      const arr = raw ? JSON.parse(raw) : [];
+      arr.push(entry);
+      localStorage.setItem(LS_HISTORY, JSON.stringify(arr));
+      window.dispatchEvent(new Event("wateringHistoryUpdated"));
+    } catch (e) {
+      console.error("Failed to write history", e);
+    }
+  }
+
+  function markLastWatered(ts = Date.now()) {
+    setLastWatered(ts);
+    localStorage.setItem(LS_KEY, ts.toString());
+    window.dispatchEvent(new Event("lastWateredUpdated"));
+  }
+
+  // --- CONTROL FUNCTIONS ---
+
+  async function startPump(modeLabel = "manual", durationSec = 10) {
+    if (pumpOn) return;
+    try {
+      await apiService.startPump(durationSec);
+    } catch (error) {
+      console.error('Failed to start pump:', error);
+      alert('Failed to start pump: ' + error.message);
+    }
+  }
+
+  async function handleAutoStart() {
+    try {
+      await apiService.startPump(8); 
+    } catch (error) {
+      console.error('Failed to auto-start pump:', error);
+    }
+  }
+
+  async function stopPumpEarly(modeLabel = "manual", { force = false } = {}) {
+    if (!pumpOn && !force) return;
+
+    try {
+      setIsStopSubmitting(true);
+      const result = await apiService.stopPump();
+      
+      // Add to history
+      const start = pumpStartRef.current || Date.now();
+      const durationMs = result.runTime || (Date.now() - start);
+      const flow = sensors.flow || 0;
+      const liters = (flow * durationMs) / 60000.0;
+
+      addHistoryEntry({
+        timestamp: Date.now(),
+        mode: modeLabel,
+        durationMs,
+        estimatedLiters: liters,
+        sensors: { ...sensors },
+        stoppedEarly: true,
+      });
+
+      markLastWatered(Date.now());
+    } catch (error) {
+      console.error('Failed to stop pump:', error);
+      alert('Failed to stop pump: ' + error.message);
+    } finally {
+      setIsStopSubmitting(false);
+    }
+  }
+
+  function requestStopPump(modeLabel) {
+    if (!pumpOn) return;
+    setStopConfirmData({
+      mode: modeLabel,
+      remainingMs: remainingRef.current,
+      sensors: { ...sensors },
+    });
+  }
+
+  function handleCancelStop() {
+    if (isStopSubmitting) return;
+    setStopConfirmData(null);
+  }
+
+  async function handleConfirmStop() {
+    if (!stopConfirmData) return;
+    await stopPumpEarly(stopConfirmData.mode || "manual", { force: true });
+    setStopConfirmData(null);
+  }
+
+  async function handleManualStart() {
+    await startPump("manual", manualDurationSec);
+  }
+
+  // --- MODE TOGGLE LOGIC (Updated for AI) ---
+  async function handleModeToggle() {
+    // Danh sách chế độ vòng lặp
+    const modes = ["manual", "automatic", "ai"];
+    const currentIndex = modes.indexOf(mode);
+    const nextMode = modes[(currentIndex + 1) % modes.length];
+
+    try {
+      await apiService.setMode(nextMode);
+    } catch (error) {
+      console.error('Failed to change mode:', error);
+      alert('Failed to change mode: ' + error.message);
+    }
+  }
+
+  // UI State Text
+  const statusText = pumpOn
+    ? `Watering — remaining ${formatMs(remainingMs)}`
+    : "Not watering";
+
+  return (
+    <div className="p-6 max-w-6xl mx-auto">
+      <div className="bg-gradient-to-br from-white via-slate-50 to-gray-50 p-6 rounded-2xl shadow-lg">
+        
+        {/* HEADER */}
+        <header className="flex items-center justify-between mb-6">
+          <div>
+            <h1 className="text-2xl font-extrabold text-gray-900">Smart Watering Dashboard</h1>
+            <p className="text-sm text-gray-500">Live sensor status & remote control</p>
+          </div>
+
+          <div className="flex items-center gap-4">
+            <p className="text-sm text-gray-600">Mode</p>
+            {/* Nút chuyển chế độ thông minh 3 trạng thái */}
+            <button
+              onClick={handleModeToggle}
+              disabled={isLoading}
+              className={`px-5 py-2 rounded-full font-bold border transition-all shadow-sm ${
+                mode === "manual" 
+                  ? "bg-gray-100 text-gray-600 border-gray-300 hover:bg-gray-200"
+                  : mode === "automatic"
+                  ? "bg-green-100 text-green-700 border-green-300 hover:bg-green-200"
+                  : "bg-purple-100 text-purple-700 border-purple-300 hover:bg-purple-200 ring-2 ring-purple-200"
+              } ${isLoading ? "opacity-50 cursor-not-allowed" : ""}`}
+            >
+              {mode === "manual" ? "🛠 Manual" : mode === "automatic" ? "⚡ Automatic" : "🧠 AI Brain"}
+            </button>
+            
+            <div className="flex items-center gap-2">
+              <span className={`w-2 h-2 rounded-full ${isConnected ? "bg-green-500" : "bg-red-500"}`}></span>
+              <span className="text-xs text-gray-500">
+                {isConnected ? "Connected" : "Disconnected"}
+              </span>
+            </div>
+          </div>
+        </header>
+
+        {/* --- AI INSIGHT PANEL (Chỉ hiện khi mode là AI) --- */}
+        {mode === "ai" && (
+          <div className="mb-6 bg-gradient-to-r from-indigo-50 to-purple-50 border border-indigo-100 p-4 rounded-xl flex items-center gap-4 shadow-sm animate-pulse">
+            <div className="p-3 bg-white rounded-full shadow-sm text-2xl">🤖</div>
+            <div>
+              <h3 className="font-bold text-indigo-900">AI monitors activity</h3>
+              <p className="text-sm text-indigo-700 mt-1">
+                Decision Tree is analyzing:
+                <span className="font-semibold mx-1">Soild ({sensors.soil}%)</span>, 
+                <span className="font-semibold mx-1">Temperature ({sensors.temp}°C)</span> và
+                <span className="font-semibold mx-1">Humidnity ({sensors.hum}%)</span>.
+              </p>
+              <div className="mt-2 text-xs font-medium bg-white px-2 py-1 rounded border border-indigo-100 inline-block">
+                Pump status: {pumpOn ? <span className="text-green-600">WATERING (AI decision)</span> : <span className="text-gray-500">WAITING</span>}
+              </div>
+            </div>
+          </div>
+        )}
+
+        <main className="grid grid-cols-1 md:grid-cols-3 gap-6">
+          {/* Sensor Panel - Hiện tại truyền props sensors đã có 'light' */}
+          <SensorPanel sensors={sensors} />
+
+          {/* Right Sidebar */}
+          <aside className="bg-white p-5 rounded-xl shadow-sm flex flex-col gap-4">
+            {/* Watering Status */}
+            <div>
+              <h4 className="text-xs text-gray-500">Watering status</h4>
+              <div
+                className={`mt-2 p-3 rounded-md border ${
+                  pumpOn ? "bg-green-50 border-green-200" : "bg-gray-50 border-gray-200"
+                }`}
+              >
+                <div className={`text-lg font-semibold ${pumpOn ? "text-green-700" : "text-gray-700"}`}>
+                  {statusText}
+                </div>
+                <div className="text-xs text-gray-500 mt-1">
+                  {pumpOn ? "Pump is running" : "System idle"}
+                </div>
+              </div>
+            </div>
+
+            {/* Manual Duration */}
+            <div>
+              <h4 className="text-xs text-gray-500">Manual watering duration</h4>
+              <select
+                value={manualDurationSec}
+                onChange={(e) => setManualDurationSec(parseInt(e.target.value))}
+                className="mt-2 px-3 py-1 border rounded text-sm"
+                disabled={mode === "ai"} // Khóa khi dùng AI
+              >
+                <option value={5}>5s</option>
+                <option value={10}>10s</option>
+                <option value={15}>15s</option>
+              </select>
+            </div>
+
+            {/* Pump Control Button */}
+            <div>
+              <h4 className="text-xs text-gray-500">Pump Control</h4>
+
+              {!pumpOn ? (
+                <button
+                  onClick={() => {
+                    if (mode === "manual") handleManualStart();
+                    else startPump("automatic", 8);
+                  }}
+                  // Vô hiệu hóa nút bấm khi đang kết nối, loading HOẶC đang ở chế độ AI (để AI tự quyết)
+                  disabled={isLoading || !isConnected || mode === "ai"}
+                  className={`w-full mt-3 px-4 py-3 rounded-2xl font-bold text-lg text-white transition-colors ${
+                    isLoading || !isConnected || mode === "ai"
+                      ? "bg-gray-300 cursor-not-allowed" 
+                      : "bg-green-600 hover:bg-green-700"
+                  }`}
+                >
+                  {mode === "ai" ? "AI Controlling..." : "Start Pump"}
+                </button>
+              ) : (
+                <button
+                  onClick={() => requestStopPump(mode)}
+                  disabled={isLoading || !isConnected}
+                  className={`w-full mt-3 px-4 py-3 rounded-2xl font-bold text-lg bg-red-500 text-white hover:bg-red-600 ${
+                    isLoading || !isConnected ? "opacity-50 cursor-not-allowed" : ""
+                  }`}
+                >
+                  Stop Pump
+                </button>
+              )}
+
+              <p className="text-xs text-gray-500 mt-1">
+                {mode === "ai" 
+                  ? "Manual control disabled in AI Mode." 
+                  : "Manual stop may require confirmation."}
+              </p>
+            </div>
+
+            {/* Last Watered Timestamp */}
+            <LastWatered
+              lastWateredTimestamp={lastWatered}
+              onClear={() => {
+                setLastWatered(null);
+                localStorage.removeItem(LS_KEY);
+              }}
+            />
+
+            <div className="pt-4 text-xs text-gray-400">
+              <p>
+                Backend: <span className={isConnected ? "text-green-600" : "text-red-600"}>{isConnected ? "● Connected" : "● Disconnected"}</span>
+              </p>
+              <p className="mt-1">Firmware: v1.2.3</p>
+            </div>
+          </aside>
+        </main>
+
+        <footer className="mt-6 text-sm text-gray-500 text-center">
+          · Designed for ESP32 · 
+        </footer>
+      </div>
+
+      {/* Confirm Stop Modal */}
+      {stopConfirmData && (
+        <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/40 backdrop-blur-sm px-4">
+          <div className="w-full max-w-md bg-white rounded-2xl shadow-2xl p-6">
+            <h2 className="text-xl font-semibold text-gray-900 mb-2">Stop watering early?</h2>
+            <p className="text-sm text-gray-600 mb-4">
+              Pump still has <strong>{formatMs(stopConfirmData.remainingMs)}</strong> remaining.
+              Stopping now will end the cycle early and log a shortened run.
+            </p>
+
+            <div className="mb-4 bg-gray-50 p-3 rounded-lg text-sm">
+              <div><strong>Mode:</strong> {stopConfirmData.mode}</div>
+              <div><strong>Remaining:</strong> {formatMs(stopConfirmData.remainingMs)}</div>
+              <div className="text-xs text-gray-600 mt-2">
+                Temp: {stopConfirmData.sensors?.temp}°C · Hum: {stopConfirmData.sensors?.hum}% · Soil: {stopConfirmData.sensors?.soil}% · Level: {stopConfirmData.sensors?.level}%
+              </div>
+            </div>
+
+            <div className="flex justify-end gap-3">
+              <button
+                onClick={handleCancelStop}
+                disabled={isStopSubmitting}
+                className={`px-4 py-2 rounded border text-sm font-medium ${
+                  isStopSubmitting ? "opacity-50 cursor-not-allowed" : ""
+                }`}
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleConfirmStop}
+                disabled={isStopSubmitting}
+                className={`px-4 py-2 rounded bg-red-600 text-white text-sm font-semibold shadow ${
+                  isStopSubmitting ? "opacity-50 cursor-not-allowed" : "hover:bg-red-700"
+                }`}
+              >
+                {isStopSubmitting ? "Stopping..." : "Stop anyway"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
