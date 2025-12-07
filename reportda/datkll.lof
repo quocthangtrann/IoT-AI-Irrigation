@@ -1,0 +1,5 @@
+\babel@toc {english}{}\relax 
+\contentsline {figure}{\numberline {1}{\ignorespaces Schematic of the project}}{7}{figure.1}%
+\contentsline {figure}{\numberline {2}{\ignorespaces Mutex-based data flow between sensor tasks, shared state, telemetry and pump control}}{14}{figure.2}%
+\contentsline {figure}{\numberline {3}{\ignorespaces Command execution path for manual/remote pump control}}{15}{figure.3}%
+\contentsline {figure}{\numberline {4}{\ignorespaces Command execution path for manual/remote pump control}}{16}{figure.4}%
